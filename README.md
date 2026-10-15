@@ -98,6 +98,26 @@ npm test    # node:test, mocked fetch — 23 assertions incl.:
             # temperature lock, stateless packaging
 ```
 
+## Deploying to Vercel
+
+The repo is Vercel-ready: `vercel.json` serves `public/` as the static
+frontend and `api/max.js` as the serverless function (same `/api/max`
+contract as the local demo).
+
+1. Import `https://github.com/Cxsmxnaut/max-grademaxxing` at
+   vercel.com/new — no build settings needed; the config is committed.
+2. Project → Settings → Environment Variables — add:
+   `GROQ_API_KEYS`, `OPENROUTER_API_KEYS`, `GEMINI_API_KEYS` (comma-separated
+   lists, same format as `.env.example`), plus optional `APP_NAME` /
+   `*_MODEL` overrides. Production + Preview both.
+3. Deploy.
+
+Note: `.vercel/` is intentionally **not** in the repo — it is a local CLI
+link folder (`npx vercel link`) that Vercel tells you to keep out of git.
+With the Git integration above you never need it. The mesh's per-instance
+429 benches survive warm serverless invocations; cold starts simply begin
+with a clean pool — callers never notice.
+
 ## Security notes
 
 - Provider keys live **only** in server env vars — never in the client, the
