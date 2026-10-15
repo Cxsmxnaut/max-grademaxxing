@@ -158,9 +158,28 @@
     font-size: 15px;
     line-height: 1.65;
     color: var(--text);
-    white-space: pre-wrap;
+    white-space: normal;          /* markdown blocks manage their own spacing */
     overflow-wrap: anywhere;
   }
+  /* markdown subset inside Max replies (renderer is escape-first, XSS-safe) */
+  .reply p   { margin: 0 0 .6em; }
+  .reply p:last-child { margin-bottom: 0; }
+  .reply strong { font-weight: 650; }
+  .reply em     { font-style: italic; }
+  .reply del    { opacity: .65; }
+  .reply code {
+    font-family: var(--mono); font-size: .88em;
+    background: rgba(255,255,255,.08); border: 1px solid var(--border);
+    border-radius: 5px; padding: .1em .38em;
+  }
+  .reply pre {
+    background: #101010; border: 1px solid var(--border); border-radius: 10px;
+    padding: 12px 14px; overflow-x: auto; margin: .5em 0;
+  }
+  .reply pre code { background: none; border: none; padding: 0; font-size: 13px; line-height: 1.5; }
+  .reply ul, .reply ol { margin: .35em 0 .65em; padding-left: 1.4em; }
+  .reply li { margin: .18em 0; }
+  .reply h3 { font-size: 15px; font-weight: 650; margin: .25em 0 .35em; letter-spacing: -.01em; }
 
   .msg--error .reply { color: var(--warn); font-size: 13.5px; opacity: .9; }
 
@@ -336,6 +355,73 @@
     if (hero) hero.remove();
   }
 
+  /* ── markdown rendering (safe subset) ───────────────────────────── */
+  // Escape first and generate every tag ourselves — model output never
+  // becomes raw HTML. Covers what Max actually emits: **bold**, *italic*,
+  // `code`, fenced code blocks, - / 1. lists, ### headings, ~~strike~~.
+  const mdEscape = (s) =>
+    s.replace(/&/g, '&amp;').replace(/</g, '&lt;')
+     .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+  function renderMarkdown(src) {
+    // fenced code blocks → placeholders (escaped at extraction)
+    const fences = [];
+    let text = String(src).replace(/```[a-z]*\n?([\s\S]*?)```/gi, (_m, code) => {
+      fences.push('<pre><code>' + mdEscape(code.replace(/\n+$/, '')) + '</code></pre>');
+      return '\u0000F' + (fences.length - 1) + '\u0000';
+    });
+
+    text = mdEscape(text);
+
+    // inline code → placeholders so emphasis never rewrites inside it
+    const spans = [];
+    text = text.replace(/`([^`\n]+)`/g, (_m, code) => {
+      spans.push('<code>' + code + '</code>');
+      return '\u0000C' + (spans.length - 1) + '\u0000';
+    });
+
+    // emphasis, per line — runs before block parsing so it never touches
+    // the tags we generate. Tight bounds keep "5 * 3 * 2" literal.
+    const emphasize = (line) => line
+      .replace(/\*\*\*(?!\s)([^*]+?)(?<!\s)\*\*\*/g, '<strong><em>$1</em></strong>')
+      .replace(/\*\*(?!\s)([^*]+?)(?<!\s)\*\*/g, '<strong>$1</strong>')
+      .replace(/(^|[\s(])\*(?!\s)([^*\n]+?)(?<!\s)\*(?=$|[\s).,!?;:])/, '$1<em>$2</em>')
+      .replace(/(^|[\s(])_(?!\s)([^_\n]+?)(?<!\s)_(?=$|[\s).,!?;:])/, '$1<em>$2</em>')
+      .replace(/~~(?!\s)([^~]+?)(?<!\s)~~/g, '<del>$1</del>');
+
+    const out = [];
+    let list = null;
+    let para = [];
+    const flushPara = () => { if (para.length) { out.push('<p>' + para.join('<br>') + '</p>'); para = []; } };
+    const flushList = () => { if (list) { out.push('</' + list + '>'); list = null; } };
+
+    for (const raw of text.split('\n')) {
+      const line = raw.trimEnd();
+      if (!line.trim()) { flushPara(); flushList(); continue; }
+      // fence placeholders stand alone as blocks, never inside <p>
+      if (/^\u0000F\d+\u0000$/.test(line.trim())) { flushPara(); flushList(); out.push(line.trim()); continue; }
+      const heading = line.match(/^\s{0,3}#{1,6}\s+(.*)$/);
+      if (heading) { flushPara(); flushList(); out.push('<h3>' + emphasize(heading[1]) + '</h3>'); continue; }
+      const ul = line.match(/^\s*[-*+]\s+(.*)$/);
+      const ol = line.match(/^\s*\d+[.)]\s+(.*)$/);
+      if (ul || ol) {
+        flushPara();
+        const kind = ul ? 'ul' : 'ol';
+        if (list !== kind) { flushList(); out.push('<' + kind + '>'); list = kind; }
+        out.push('<li>' + emphasize((ul || ol)[1]) + '</li>');
+        continue;
+      }
+      flushList();
+      para.push(emphasize(line));
+    }
+    flushPara();
+    flushList();
+
+    return out.join('')
+      .replace(/\u0000C(\d+)\u0000/g, (_m, i) => spans[+i])
+      .replace(/\u0000F(\d+)\u0000/g, (_m, i) => fences[+i]);
+  }
+
   function addMessage(role, text) {
     clearWelcome();
     const msg = document.createElement('div');
@@ -352,7 +438,9 @@
       who.textContent = role === 'error' ? 'system' : 'max';
       const reply = document.createElement('div');
       reply.className = 'reply';
-      reply.textContent = text;
+      // errors stay plain text; Max replies render the markdown subset
+      if (role === 'error') reply.textContent = text;
+      else reply.innerHTML = renderMarkdown(text);
       msg.append(who, reply);
     }
     thread.appendChild(msg);
