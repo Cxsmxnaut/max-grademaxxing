@@ -1,0 +1,453 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>max · grademaxxing</title>
+<style>
+  /* ═══════════════════════════════════════════════════════════════════
+     max chat window — Open WebUI-inspired dark shell, folk.com typing.
+     Zero dependencies. Drop this component anywhere with an iframe,
+     or port the classes 1:1 into your framework.
+     ═══════════════════════════════════════════════════════════════════ */
+  :root {
+    --bg:            #171717;   /* canvas, OWUI dark */
+    --surface:       #212121;   /* composer / chips */
+    --surface-hover: #2a2a2a;
+    --bubble:        #303030;   /* user messages */
+    --border:        rgba(255, 255, 255, .08);
+    --border-strong: rgba(255, 255, 255, .16);
+    --text:          #ececec;   /* primary type */
+    --text-dim:      #9b9b9b;   /* labels, hints */
+    --text-faint:    #6e6e6e;
+    --accent:        #ececec;   /* send button fill */
+    --on-accent:     #171717;
+    --warn:          #d9a05b;
+    --radius-composer: 24px;
+    --radius-bubble: 18px;
+    --thread-w: 768px;
+    --font: 'Inter', 'SF Pro Text', -apple-system, BlinkMacSystemFont, 'Segoe UI',
+            Roboto, Helvetica, Arial, sans-serif;
+    --mono: 'SF Mono', ui-monospace, 'Cascadia Mono', Menlo, Consolas, monospace;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 15px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    overflow: hidden;
+  }
+
+  /* ── shell ────────────────────────────────────────────────────────── */
+  .max-chat {
+    height: 100dvh;
+    display: flex;
+    flex-direction: column;
+    position: relative;
+  }
+
+  /* header: hairline, translucent, OWUI-style */
+  .max-chat__topbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 14px 20px;
+    border-bottom: 1px solid var(--border);
+    background: color-mix(in srgb, var(--bg) 82%, transparent);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    position: relative;
+    z-index: 10;
+    flex: none;
+  }
+  .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .brand__mark {
+    width: 22px; height: 22px; border-radius: 7px;
+    background: var(--text);
+    color: var(--on-accent);
+    display: grid; place-items: center;
+    font-size: 12px; font-weight: 700; letter-spacing: -.02em;
+    flex: none;
+  }
+  .brand__name {
+    font-size: 13.5px; font-weight: 600; letter-spacing: -.01em;
+    color: var(--text); white-space: nowrap;
+  }
+  .brand__name span { color: var(--text-dim); font-weight: 500; }
+  .model-chip {
+    display: inline-flex; align-items: center; gap: 7px;
+    font-size: 12px; color: var(--text-dim);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    padding: 5px 11px; border-radius: 999px;
+    font-family: var(--mono);
+    letter-spacing: .01em;
+    white-space: nowrap;
+  }
+  .model-chip::before {
+    content: ""; width: 6px; height: 6px; border-radius: 50%;
+    background: #57d982; box-shadow: 0 0 6px rgba(87, 217, 130, .7);
+  }
+
+  /* ── scroll thread ────────────────────────────────────────────────── */
+  .max-chat__scroll {
+    flex: 1;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+  .max-chat__scroll::-webkit-scrollbar { width: 10px; }
+  .max-chat__scroll::-webkit-scrollbar-thumb {
+    background: rgba(255,255,255,.12);
+    border-radius: 8px;
+    border: 3px solid var(--bg);
+  }
+  .max-chat__scroll::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,.22); }
+  .thread {
+    max-width: var(--thread-w);
+    margin: 0 auto;
+    padding: 36px 24px 28px;
+    display: flex;
+    flex-direction: column;
+    gap: 28px;
+  }
+
+  /* welcome state */
+  .hero { padding: 9vh 0 4vh; text-align: center; }
+  .hero__kicker {
+    font-family: var(--mono); font-size: 11px; letter-spacing: .18em;
+    text-transform: uppercase; color: var(--text-faint); margin-bottom: 14px;
+  }
+  .hero__title {
+    font-size: clamp(26px, 4vw, 34px); font-weight: 600; letter-spacing: -.03em;
+    line-height: 1.15; margin-bottom: 10px;
+  }
+  .hero__sub { color: var(--text-dim); font-size: 14.5px; }
+
+  /* ── messages ─────────────────────────────────────────────────────── */
+  .msg { display: flex; flex-direction: column; animation: rise .18s ease-out both; }
+  @keyframes rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+  .msg--user { align-items: flex-end; }
+  .msg--user .bubble {
+    background: var(--bubble);
+    color: var(--text);
+    padding: 10px 18px;
+    border-radius: var(--radius-bubble);
+    border-bottom-right-radius: 6px;      /* OWUI speech-tail corner */
+    max-width: 82%;
+    font-size: 15px;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  .msg--max { align-items: flex-start; gap: 6px; }
+  .msg--max .who {
+    font-family: var(--mono);
+    font-size: 10.5px; letter-spacing: .16em; text-transform: uppercase;
+    color: var(--text-faint);
+    padding-left: 1px;
+  }
+  .msg--max .reply {
+    font-size: 15px;
+    line-height: 1.65;
+    color: var(--text);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  .msg--error .reply { color: var(--warn); font-size: 13.5px; opacity: .9; }
+
+  /* typing indicator */
+  .typing { display: inline-flex; gap: 5px; padding: 12px 16px; align-items: center;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius-bubble); border-top-left-radius: 6px; }
+  .typing i {
+    width: 6px; height: 6px; border-radius: 50%; background: var(--text-dim);
+    animation: blink 1.2s infinite ease-in-out;
+  }
+  .typing i:nth-child(2) { animation-delay: .18s; }
+  .typing i:nth-child(3) { animation-delay: .36s; }
+  @keyframes blink { 0%, 80%, 100% { opacity: .25; transform: translateY(0); } 40% { opacity: 1; transform: translateY(-3px); } }
+
+  /* ── composer: borderless, OWUI-style ─────────────────────────────── */
+  .max-chat__composer-wrap { flex: none; padding: 8px 20px calc(16px + env(safe-area-inset-bottom)); }
+  .composer {
+    max-width: var(--thread-w);
+    margin: 0 auto;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-composer);
+    padding: 6px 6px 6px 4px;
+    display: flex;
+    align-items: flex-end;
+    gap: 4px;
+    transition: border-color .15s ease, box-shadow .15s ease;
+    box-shadow: 0 8px 28px rgba(0,0,0,.35);
+  }
+  .composer:focus-within {
+    border-color: var(--border-strong);
+    box-shadow: 0 8px 28px rgba(0,0,0,.35), 0 0 0 3px rgba(255,255,255,.04);
+  }
+  .composer__input {
+    flex: 1;
+    background: transparent;
+    border: none;
+    outline: none;
+    resize: none;
+    color: var(--text);
+    font: inherit;
+    font-size: 15px;
+    line-height: 1.5;
+    padding: 11px 8px 11px 18px;
+    max-height: 180px;
+    min-height: 44px;
+    field-sizing: content;      /* modern auto-grow; JS fallback below */
+    caret-color: var(--text);
+  }
+  .composer__input::placeholder { color: var(--text-faint); }
+  .composer__input::-webkit-scrollbar { width: 6px; }
+  .composer__input::-webkit-scrollbar-thumb { background: rgba(255,255,255,.14); border-radius: 6px; }
+
+  .composer__send {
+    flex: none;
+    width: 36px; height: 36px;
+    border: none;
+    border-radius: 50%;
+    background: var(--accent);
+    color: var(--on-accent);
+    display: grid; place-items: center;
+    cursor: pointer;
+    margin: 4px 2px 4px 0;
+    transition: transform .12s ease, opacity .12s ease, background .12s ease;
+  }
+  .composer__send:hover:not(:disabled) { transform: translateY(-1px); background: #fff; }
+  .composer__send:active:not(:disabled) { transform: translateY(0) scale(.96); }
+  .composer__send:disabled { background: #333; color: #6b6b6b; cursor: default; }
+  .composer__send svg { width: 17px; height: 17px; }
+
+  .fineprint {
+    max-width: var(--thread-w);
+    margin: 10px auto 0;
+    text-align: center;
+    font-size: 11.5px;
+    color: var(--text-faint);
+    letter-spacing: .01em;
+  }
+
+  @media (max-width: 640px) {
+    .thread { padding: 26px 16px 22px; gap: 24px; }
+    .max-chat__composer-wrap { padding-inline: 12px; }
+    .msg--user .bubble { max-width: 90%; }
+    .brand__name span { display: none; }
+  }
+</style>
+</head>
+<body>
+<div class="max-chat">
+  <!-- top bar -->
+  <header class="max-chat__topbar">
+    <div class="brand">
+      <div class="brand__mark">m</div>
+      <div class="brand__name">max <span>· grademaxxing</span></div>
+    </div>
+    <div class="model-chip" id="model-chip">max · mesh</div>
+  </header>
+
+  <!-- messages -->
+  <main class="max-chat__scroll" id="scroll">
+    <div class="thread" id="thread"></div>
+  </main>
+
+  <!-- composer -->
+  <footer class="max-chat__composer-wrap">
+    <form class="composer" id="composer" autocomplete="off">
+      <textarea
+        class="composer__input"
+        id="input"
+        rows="1"
+        placeholder="ask max anything…"
+        aria-label="message max"
+      ></textarea>
+      <button class="composer__send" id="send" type="submit" disabled aria-label="send message">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"
+             stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+      </button>
+    </form>
+    <p class="fineprint">max can make mistakes — double-check the math.</p>
+  </footer>
+</div>
+
+<script>
+/* ═══ Max chat window — UI behaviour only ═══════════════════════════ */
+(() => {
+  'use strict';
+
+  const thread  = document.getElementById('thread');
+  const scroll  = document.getElementById('scroll');
+  const form    = document.getElementById('composer');
+  const input   = document.getElementById('input');
+  const sendBtn = document.getElementById('send');
+
+  const DEMO = new URLSearchParams(location.search).has('demo');
+  // active screen context — grade/trend data packaged with every request
+  const STUDENT_CONTEXT = {
+    screen: 'course-overview',
+    course: 'AP Chemistry',
+    currentAverage: 88.4,
+    trend: [
+      { unit: 'unit 1', score: 92 },
+      { unit: 'unit 2', score: 78 },
+    ],
+    upcoming: [{ assessment: 'final exam', weight: 0.25 },
+               { assessment: 'lab practical', weight: 0.1 }],
+  };
+
+  const DEMO_SEED = [
+    { role: 'user', text: 'unit 2 was a 78 and it was worth 20% of my grade. what did that do to my average?' },
+    { role: 'max',  text:
+`Good question — let's break it down. Unit 2 was worth 20%, so it contributed 0.20 × 78 = 15.6 points to your average. If you'd scored a 92 there instead, you would have earned 18.4 points, so that one unit pulled you down by about 2.8 points. Your overall average still sits at a healthy 88.4.` },
+    { role: 'user', text: 'what do i need on the final to finish above 90?' },
+    { role: 'max',  text:
+`Good news — it's very much within reach. You've locked in 89.2 across the units so far, and with the practical at an 88 that puts you at 66.8 weighted points. To land at 90 you need 90 − 66.8 = 23.2 more, and since the final is worth 25%, that works out to 23.2 ÷ 0.25 = 92.8. So aim for about a 93 on the final and you're comfortably there.` },
+  ];
+  const DEMO_REPLIES = [
+`Here's the quick picture: your current average is 88.4, and your trend shows a 14-point drop from unit 1 to unit 2. That's worth paying attention to, but it's very recoverable — the two upcoming assessments are worth 35% of your grade combined, so there's plenty of room to move the needle.`,
+`Let's look at your spread: your best unit is a 92 and your worst is a 78, so there's a 14-point gap to close. The good news is that stabilizing is usually the fastest win here — one unit above 90 and your trend line turns right back up.`,
+`Okay, let's do the math. The final is worth 25% and the lab practical is 10%, which means the final is 2.5× more impactful. Score a 90 on the final and that alone contributes 22.5 weighted points toward your semester — so it's definitely where I'd focus your energy first.`,
+  ];
+
+  /* ── rendering ─────────────────────────────────────────────────────── */
+  const atBottom = () => scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 60;
+  // pin instantly (no animation) so the newest message is always visible,
+  // even in webviews that throttle scroll animations
+  const pinBottom = (force = false) => {
+    if (force || atBottom()) scroll.scrollTo({ top: scroll.scrollHeight, behavior: 'instant' });
+  };
+
+  function clearWelcome() {
+    const hero = thread.querySelector('.hero');
+    if (hero) hero.remove();
+  }
+
+  function addMessage(role, text) {
+    clearWelcome();
+    const msg = document.createElement('div');
+    msg.className = `msg msg--${role === 'user' ? 'user' : role === 'error' ? 'max msg--error' : 'max'}`;
+
+    if (role === 'user') {
+      const bubble = document.createElement('div');
+      bubble.className = 'bubble';
+      bubble.textContent = text;
+      msg.appendChild(bubble);
+    } else {
+      const who = document.createElement('div');
+      who.className = 'who';
+      who.textContent = role === 'error' ? 'system' : 'max';
+      const reply = document.createElement('div');
+      reply.className = 'reply';
+      reply.textContent = text;
+      msg.append(who, reply);
+    }
+    thread.appendChild(msg);
+    pinBottom(true);
+    return msg;
+  }
+
+  function addTyping() {
+    clearWelcome();
+    const msg = document.createElement('div');
+    msg.className = 'msg msg--max';
+    msg.innerHTML = '<div class="who">max</div><div class="typing"><i></i><i></i><i></i></div>';
+    thread.appendChild(msg);
+    pinBottom(true);
+    return msg;
+  }
+
+  function showWelcome() {
+    thread.innerHTML = `
+      <div class="hero">
+        <div class="hero__kicker">grademaxxing</div>
+        <div class="hero__title">ask max.</div>
+        <div class="hero__sub">clear answers about your grades — with the math to back it up.</div>
+      </div>`;
+  }
+
+  /* ── composer behaviour ────────────────────────────────────────────── */
+  const syncSend = () => { sendBtn.disabled = input.value.trim() === '' || busy; };
+
+  const autoGrow = () => {
+    input.style.height = 'auto';
+    input.style.height = Math.min(input.scrollHeight, 180) + 'px';
+  };
+  input.addEventListener('input', () => { autoGrow(); syncSend(); });
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); form.requestSubmit(); }
+  });
+
+  /* ── sending ───────────────────────────────────────────────────────── */
+  let busy = false;
+  let demoIdx = 0;
+
+  async function ask(userQuery) {
+    if (busy) return;
+    busy = true; syncSend();
+    addMessage('user', userQuery);
+    const typing = addTyping();
+
+    try {
+      let reply;
+      if (DEMO) {
+        await new Promise((r) => setTimeout(r, 650));
+        reply = userQuery
+          ? DEMO_REPLIES[demoIdx++ % DEMO_REPLIES.length]
+          : DEMO_SEED[2].text;
+      } else {
+        const res = await fetch('/api/max', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ studentDataContext: STUDENT_CONTEXT, userQuery }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || `request failed (${res.status})`);
+        reply = data.text;
+      }
+      typing.remove();
+      addMessage('max', reply);
+    } catch (err) {
+      typing.remove();
+      addMessage('error', `connection error — ${err.message}`);
+    } finally {
+      busy = false;
+      input.focus();
+      syncSend();
+    }
+  }
+
+  form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const text = input.value.trim();
+    if (!text || busy) return;
+    input.value = '';
+    autoGrow();
+    ask(text);
+  });
+
+  /* ── boot ──────────────────────────────────────────────────────────── */
+  showWelcome();
+  if (DEMO) {
+    document.getElementById('model-chip').textContent = 'max · demo';
+    for (const m of DEMO_SEED) addMessage(m.role, m.text);
+  }
+  syncSend();
+  input.focus();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,16 @@
+{
+  "name": "grademaxxing-max-engine",
+  "version": "1.0.0",
+  "description": "Stateless AI routing engine (Token Mesh) + Max persona for Grademaxxing. $0.00 free-tier pooled routing across Groq, OpenRouter and Mistral.",
+  "type": "module",
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "test": "node --test",
+    "demo": "node demo/server.js"
+  },
+  "license": "UNLICENSED",
+  "private": true
+}
