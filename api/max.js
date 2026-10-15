@@ -12,7 +12,7 @@
  * benches; cold starts simply begin with a clean pool. Either way the caller
  * only ever sees a successful reply or a clean JSON error.
  */
-import { askMaxDetailed, UpstreamError, PoolExhaustedError } from '../src/index.js';
+import { askMaxDetailed } from '../src/index.js';
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -40,24 +40,26 @@ export default async function handler(req, res) {
       usage: result.usage,
     });
   } catch (err) {
-    if (err instanceof PoolExhaustedError) {
-      return res.status(503).json({ error: err.message, type: err.name, retryable: true });
+    // Classify by message/name first — not just instanceof: "No provider
+    // keys" is a plain Error, and bundlers can duplicate error classes so
+    // instanceof fails while .name survives.
+    const name = err?.name ?? 'Error';
+    const message = typeof err?.message === 'string' ? err.message : '';
+    const attempts = Array.isArray(err?.attempts) ? err.attempts.map(({ detail, ...a }) => a) : [];
+
+    if (message.includes('No provider keys configured')) {
+      return res.status(503).json({ error: message, type: 'NotConfigured', retryable: false });
     }
-    if (err instanceof UpstreamError) {
-      return res.status(502).json({
-        error: 'all pooled provider keys failed',
-        type: err.name,
-        attempts: err.attempts.map(({ detail, ...a }) => a), // strip upstream bodies
-      });
+    if (name === 'PoolExhaustedError') {
+      return res.status(503).json({ error: message, type: name, retryable: true });
+    }
+    if (name === 'UpstreamError') {
+      return res.status(502).json({ error: message || 'all pooled provider keys failed', type: name, attempts });
     }
     if (err instanceof TypeError) {
-      // covers "No provider keys configured" and bad input (empty query)
-      return res.status(/No provider keys/.test(err.message) ? 503 : 400).json({
-        error: err.message,
-        type: err.name,
-      });
+      return res.status(400).json({ error: message, type: name });
     }
     console.error('askMax failed:', err);
-    return res.status(500).json({ error: 'internal error' });
+    return res.status(500).json({ error: 'internal error', type: name });
   }
 }

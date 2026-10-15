@@ -8,7 +8,7 @@
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
-import { askMaxDetailed, UpstreamError, PoolExhaustedError } from '../src/index.js';
+import { askMaxDetailed } from '../src/index.js';
 
 // load local dev keys if present (process.loadEnvFile: zero-dependency .env)
 if (existsSync('.env')) process.loadEnvFile('.env');
@@ -73,18 +73,22 @@ const server = createServer(async (req, res) => {
           usage: result.usage,
         });
       } catch (err) {
-        if (err instanceof PoolExhaustedError) {
-          return sendJson(res, 503, { error: err.message, type: err.name, retryable: true });
+        // match by name/message first — see api/max.js for the reasoning
+        const name = err?.name ?? 'Error';
+        const message = typeof err?.message === 'string' ? err.message : '';
+        const attempts = Array.isArray(err?.attempts) ? err.attempts.map(({ detail, ...a }) => a) : [];
+
+        if (message.includes('No provider keys configured')) {
+          return sendJson(res, 503, { error: message, type: 'NotConfigured', retryable: false });
         }
-        if (err instanceof UpstreamError) {
-          return sendJson(res, 502, {
-            error: 'all pooled provider keys failed',
-            type: err.name,
-            attempts: err.attempts.map(({ detail, ...a }) => a), // strip upstream bodies
-          });
+        if (name === 'PoolExhaustedError') {
+          return sendJson(res, 503, { error: message, type: name, retryable: true });
         }
-        if (err instanceof TypeError && /No provider keys configured/.test(err.message)) {
-          return sendJson(res, 503, { error: err.message, type: 'NotConfigured', retryable: false });
+        if (name === 'UpstreamError') {
+          return sendJson(res, 502, { error: message || 'all pooled provider keys failed', type: name, attempts });
+        }
+        if (err instanceof TypeError) {
+          return sendJson(res, 400, { error: message, type: name });
         }
         throw err;
       }
