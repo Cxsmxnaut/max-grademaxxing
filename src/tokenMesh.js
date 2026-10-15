@@ -168,13 +168,56 @@ export class TokenMesh {
     if (!payload || !Array.isArray(payload.messages)) {
       throw new TypeError('TokenMesh.complete(payload) requires payload.messages (array)');
     }
+    return this._route(
+      payload,
+      (slot) => this._attempt(slot, payload),
+      (depth) => this.complete(payload, depth),
+      _depth
+    );
+  }
 
+  /**
+   * Streaming variant: same waterfall, benching and failover as complete(),
+   * but tokens are handed to onToken as they arrive over SSE.
+   *
+   * Safe-by-construction ordering: every failure that can fail over (429,
+   * dead key, 5xx, network) happens BEFORE the first token is delivered —
+   * the provider only starts emitting after we have a 200 with a stream
+   * body. Once tokens have been delivered we cannot replay them on another
+   * key, so a mid-stream break throws UpstreamError (attempts: kind
+   * 'stream') instead of silently stitching a second provider's answer onto
+   * a partial one.
+   *
+   * @param {object} payload OpenAI-style chat payload
+   * @param {(chunk: string) => void} onToken called per content delta
+   * @returns {Promise<{text: string, provider: string, model: string, slotId: string, usage: object|null}>}
+   */
+  async completeStream(payload, onToken, _depth = 0) {
+    if (!payload || !Array.isArray(payload.messages)) {
+      throw new TypeError('TokenMesh.completeStream(payload) requires payload.messages (array)');
+    }
+    if (typeof onToken !== 'function') {
+      throw new TypeError('TokenMesh.completeStream(payload, onToken) requires onToken (function)');
+    }
+    return this._route(
+      payload,
+      (slot) => this._attemptStream(slot, payload, onToken),
+      (depth) => this.completeStream(payload, onToken, depth),
+      _depth
+    );
+  }
+
+  /**
+   * Shared routing loop for complete() and completeStream().
+   * rerun(depth) re-enters the owning method with a bumped retry depth.
+   */
+  async _route(payload, attemptFn, rerun, _depth) {
     const attempts = [];
     for (const slot of await this._nextBatch()) {
       // A concurrent request may have benched this key mid-loop — skip it.
       if (this.isBenched(slot.id)) continue;
 
-      const outcome = await this._attempt(slot, payload);
+      const outcome = await attemptFn(slot);
       if (outcome.ok) {
         this._emit({ type: 'success', slotId: slot.id, provider: slot.provider });
         return outcome.value;
@@ -184,13 +227,20 @@ export class TokenMesh {
       if (outcome.benchMs) this.bench(slot.id, outcome.benchMs);
       this._emit({ type: 'failover', slotId: slot.id, reason: outcome.error.kind, status: outcome.error.status ?? null });
 
+      // Tokens already reached the caller — another key's answer cannot be
+      // appended to a partial one, so surface the interruption immediately.
+      if (outcome.partial) {
+        const kind = outcome.error.kind;
+        throw new UpstreamError(`TokenMesh: stream interrupted mid-answer (${kind})`, attempts);
+      }
+
       // 429 and dead keys were benched — the loop instantly moves to the next
       // shuffled key. The user never sees the rate limit.
     }
 
     if (attempts.length === 0) {
       // Every slot was benched by concurrent requests before we could try one.
-      if (_depth < 3) return this.complete(payload, _depth + 1);
+      if (_depth < 3) return rerun(_depth + 1);
       throw new PoolExhaustedError('TokenMesh: pool raced to empty; retry depth exceeded');
     }
 
@@ -199,7 +249,7 @@ export class TokenMesh {
     // of surfacing an error — bounded by the retry depth and the
     // maxPoolWaitMs budget enforced inside _waitForAvailable.
     if (attempts.every((a) => a.kind === 'rate_limit') && _depth < 3) {
-      return this.complete(payload, _depth + 1);
+      return rerun(_depth + 1);
     }
 
     const kinds = attempts.map((a) => `${a.provider}/${a.kind}${a.status ? `:${a.status}` : ''}`).join(', ');
@@ -232,13 +282,137 @@ export class TokenMesh {
     }
   }
 
+  /** POST one payload to one slot; no streaming. */
   async _attempt(slot, payload) {
-    const url = `${slot.baseUrl.replace(/\/+$/, '')}/chat/completions`;
+    const url = this._chatUrl(slot);
     const body = JSON.stringify({ ...payload, model: slot.model });
 
-    let res;
+    const res = await this._post(url, slot, body);
+    if (!res.ok) return this._classifyHttp(slot, res);
+
+    const data = await res.json().catch(() => null);
+    return {
+      ok: true,
+      value: {
+        text: data?.choices?.[0]?.message?.content ?? '',
+        provider: slot.provider,
+        model: data?.model ?? slot.model,
+        slotId: slot.id,
+        usage: data?.usage ?? null,
+      },
+    };
+  }
+
+  /**
+   * POST one payload to one slot with stream:true and pump SSE deltas into
+   * onToken. Returns ok:false with partial:true once any token was
+   * delivered (the caller must not retry — see completeStream).
+   */
+  async _attemptStream(slot, payload, onToken) {
+    const url = this._chatUrl(slot);
+    const body = JSON.stringify({ ...payload, model: slot.model, stream: true });
+
+    const res = await this._post(url, slot, body);
+    if (!res.ok) return this._classifyHttp(slot, res);
+
+    // Defensive fallback: a provider that ignores stream:true answers with a
+    // normal JSON body — parse it and deliver it as one chunk.
+    const reader = typeof res.body?.getReader === 'function' ? res.body.getReader() : null;
+    if (!reader) {
+      const data = await res.json().catch(() => null);
+      const text = data?.choices?.[0]?.message?.content ?? '';
+      if (text) onToken(text);
+      return {
+        ok: true,
+        value: { text, provider: slot.provider, model: data?.model ?? slot.model, slotId: slot.id, usage: data?.usage ?? null },
+      };
+    }
+
+    const decoder = new TextDecoder();
+    let text = '';
+    let usage = null;
+    let model = slot.model;
+    let delivered = false;
+    let sawDone = false;
+    let buf = '';
+
     try {
-      res = await this.fetchImpl(url, {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+
+        let nl;
+        while ((nl = buf.indexOf('\n')) !== -1) {
+          const line = buf.slice(0, nl).trim();
+          buf = buf.slice(nl + 1);
+          if (!line || line.startsWith(':')) continue; // comments/keep-alives
+          if (!line.startsWith('data:')) continue;
+
+          const data = line.slice(5).trim();
+          if (data === '[DONE]') {
+            sawDone = true;
+            break;
+          }
+          let chunk;
+          try {
+            chunk = JSON.parse(data);
+          } catch {
+            continue; // malformed frame — skip, don't kill the stream
+          }
+          if (chunk.usage) usage = chunk.usage;
+          if (chunk.model) model = chunk.model;
+          const delta = chunk.choices?.[0]?.delta?.content;
+          if (typeof delta === 'string' && delta !== '') {
+            delivered = true;
+            text += delta;
+            onToken(delta);
+          }
+        }
+        if (sawDone) break;
+      }
+    } catch (streamError) {
+      const error = {
+        slotId: slot.id,
+        provider: slot.provider,
+        kind: delivered ? 'stream' : 'network',
+        message: truncate(streamError?.message ?? String(streamError)),
+      };
+      // partial:true only when the caller already saw tokens.
+      return { ok: false, benchMs: 0, error, partial: delivered };
+    }
+
+    // Whole body buffered but never framed as SSE (some proxies re-wrap the
+    // response): try to salvage a plain JSON completion.
+    if (!delivered && !sawDone && buf.trim().startsWith('{')) {
+      try {
+        const data = JSON.parse(buf.trim());
+        const text2 = data?.choices?.[0]?.message?.content ?? '';
+        if (text2) {
+          delivered = true;
+          text = text2;
+          if (data.usage) usage = data.usage;
+          if (data.model) model = data.model;
+          onToken(text2);
+        }
+      } catch {
+        /* not salvageable — fall through with empty text */
+      }
+    }
+
+    return {
+      ok: true,
+      value: { text, provider: slot.provider, model, slotId: slot.id, usage },
+    };
+  }
+
+  _chatUrl(slot) {
+    return `${slot.baseUrl.replace(/\/+$/, '')}/chat/completions`;
+  }
+
+  async _post(url, slot, body) {
+    try {
+      return await this.fetchImpl(url, {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
@@ -249,30 +423,29 @@ export class TokenMesh {
       });
     } catch (networkError) {
       // DNS blip, connection reset, timeout — fail over, do not bench.
+      // Returned as a response-shaped failure so both attempt paths share
+      // the classification below.
       return {
         ok: false,
-        benchMs: 0,
-        error: { slotId: slot.id, provider: slot.provider, kind: 'network', message: truncate(networkError?.message ?? String(networkError)) },
+        status: 0,
+        _networkError: truncate(networkError?.message ?? String(networkError)),
+        json: async () => null,
+        text: async () => '',
       };
     }
+  }
 
-    if (res.ok) {
-      const data = await res.json().catch(() => null);
-      return {
-        ok: true,
-        value: {
-          text: data?.choices?.[0]?.message?.content ?? '',
-          provider: slot.provider,
-          model: data?.model ?? slot.model,
-          slotId: slot.id,
-          usage: data?.usage ?? null,
-        },
-      };
+  /** Map an unsuccessful HTTP (or network) result to a bench/failover decision. */
+  async _classifyHttp(slot, res) {
+    const base = { slotId: slot.id, provider: slot.provider, status: res.status || null };
+
+    if (res._networkError !== undefined || res.status === 0) {
+      return { ok: false, benchMs: 0, error: { ...base, kind: 'network', message: res._networkError } };
     }
 
-    const status = res.status;
     const detail = truncate(await res.text().catch(() => ''));
-    const base = { slotId: slot.id, provider: slot.provider, status, detail };
+    base.detail = detail;
+    const status = res.status;
 
     if (status === 429) {
       // THE headline case: bench 60s, retry instantly on the next key.

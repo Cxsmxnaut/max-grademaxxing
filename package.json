@@ -9,7 +9,8 @@
   },
   "scripts": {
     "test": "node --test",
-    "demo": "node demo/server.js"
+    "demo": "node demo/server.js",
+    "keys": "node scripts/check-keys.js"
   },
   "license": "UNLICENSED",
   "private": true

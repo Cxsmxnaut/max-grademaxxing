@@ -303,8 +303,10 @@
   </footer>
 </div>
 
-<script>
+<script type="module">
 /* ═══ Max chat window — UI behaviour only ═══════════════════════════ */
+import { renderMarkdown } from './markdown.js';
+
 (() => {
   'use strict';
 
@@ -353,73 +355,6 @@
   function clearWelcome() {
     const hero = thread.querySelector('.hero');
     if (hero) hero.remove();
-  }
-
-  /* ── markdown rendering (safe subset) ───────────────────────────── */
-  // Escape first and generate every tag ourselves — model output never
-  // becomes raw HTML. Covers what Max actually emits: **bold**, *italic*,
-  // `code`, fenced code blocks, - / 1. lists, ### headings, ~~strike~~.
-  const mdEscape = (s) =>
-    s.replace(/&/g, '&amp;').replace(/</g, '&lt;')
-     .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-
-  function renderMarkdown(src) {
-    // fenced code blocks → placeholders (escaped at extraction)
-    const fences = [];
-    let text = String(src).replace(/```[a-z]*\n?([\s\S]*?)```/gi, (_m, code) => {
-      fences.push('<pre><code>' + mdEscape(code.replace(/\n+$/, '')) + '</code></pre>');
-      return '\u0000F' + (fences.length - 1) + '\u0000';
-    });
-
-    text = mdEscape(text);
-
-    // inline code → placeholders so emphasis never rewrites inside it
-    const spans = [];
-    text = text.replace(/`([^`\n]+)`/g, (_m, code) => {
-      spans.push('<code>' + code + '</code>');
-      return '\u0000C' + (spans.length - 1) + '\u0000';
-    });
-
-    // emphasis, per line — runs before block parsing so it never touches
-    // the tags we generate. Tight bounds keep "5 * 3 * 2" literal.
-    const emphasize = (line) => line
-      .replace(/\*\*\*(?!\s)([^*]+?)(?<!\s)\*\*\*/g, '<strong><em>$1</em></strong>')
-      .replace(/\*\*(?!\s)([^*]+?)(?<!\s)\*\*/g, '<strong>$1</strong>')
-      .replace(/(^|[\s(])\*(?!\s)([^*\n]+?)(?<!\s)\*(?=$|[\s).,!?;:])/, '$1<em>$2</em>')
-      .replace(/(^|[\s(])_(?!\s)([^_\n]+?)(?<!\s)_(?=$|[\s).,!?;:])/, '$1<em>$2</em>')
-      .replace(/~~(?!\s)([^~]+?)(?<!\s)~~/g, '<del>$1</del>');
-
-    const out = [];
-    let list = null;
-    let para = [];
-    const flushPara = () => { if (para.length) { out.push('<p>' + para.join('<br>') + '</p>'); para = []; } };
-    const flushList = () => { if (list) { out.push('</' + list + '>'); list = null; } };
-
-    for (const raw of text.split('\n')) {
-      const line = raw.trimEnd();
-      if (!line.trim()) { flushPara(); flushList(); continue; }
-      // fence placeholders stand alone as blocks, never inside <p>
-      if (/^\u0000F\d+\u0000$/.test(line.trim())) { flushPara(); flushList(); out.push(line.trim()); continue; }
-      const heading = line.match(/^\s{0,3}#{1,6}\s+(.*)$/);
-      if (heading) { flushPara(); flushList(); out.push('<h3>' + emphasize(heading[1]) + '</h3>'); continue; }
-      const ul = line.match(/^\s*[-*+]\s+(.*)$/);
-      const ol = line.match(/^\s*\d+[.)]\s+(.*)$/);
-      if (ul || ol) {
-        flushPara();
-        const kind = ul ? 'ul' : 'ol';
-        if (list !== kind) { flushList(); out.push('<' + kind + '>'); list = kind; }
-        out.push('<li>' + emphasize((ul || ol)[1]) + '</li>');
-        continue;
-      }
-      flushList();
-      para.push(emphasize(line));
-    }
-    flushPara();
-    flushList();
-
-    return out.join('')
-      .replace(/\u0000C(\d+)\u0000/g, (_m, i) => spans[+i])
-      .replace(/\u0000F(\d+)\u0000/g, (_m, i) => fences[+i]);
   }
 
   function addMessage(role, text) {
@@ -483,6 +418,105 @@
   let busy = false;
   let demoIdx = 0;
 
+  // #1 — conversation memory. The client owns the thread: only completed
+  // exchanges are recorded, and the last 6 turns ride along with each
+  // request so Max can refer back. Nothing is stored server-side.
+  const history = [];
+  const HISTORY_TURNS = 6;
+
+  /**
+   * Streaming request: POST /api/max with { stream: true } and render each
+   * SSE token as it lands. Returns the final reply text.
+   * Frames: {t} per token, {done,text,provider,model}, {error,…}.
+   */
+  async function askStreamed(userQuery, typing) {
+    const res = await fetch('/api/max', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'text/event-stream' },
+      body: JSON.stringify({
+        studentDataContext: STUDENT_CONTEXT,
+        userQuery,
+        history: history.slice(-HISTORY_TURNS),
+        stream: true,
+      }),
+    });
+
+    const ctype = res.headers.get('content-type') || '';
+    if (!res.ok || !ctype.includes('text/event-stream')) {
+      // error path (or a deploy without streaming): fall back to JSON
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error || `request failed (${res.status})`);
+    }
+    if (!res.body) throw new Error('no response stream');
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    let raw = '';
+    let final = null;
+    let failure = null;
+    let replyEl = null;
+
+    // First token swaps the typing indicator for the real reply bubble.
+    const ensureReply = () => {
+      if (replyEl) return replyEl;
+      typing.remove();
+      const msg = document.createElement('div');
+      msg.className = 'msg msg--max';
+      const who = document.createElement('div');
+      who.className = 'who';
+      who.textContent = 'max';
+      replyEl = document.createElement('div');
+      replyEl.className = 'reply';
+      msg.append(who, replyEl);
+      thread.appendChild(msg);
+      pinBottom(true);
+      return replyEl;
+    };
+
+    const handle = (ev) => {
+      if (typeof ev.t === 'string' && ev.t !== '') {
+        raw += ev.t;
+        // escape-first renderer, safe to re-run on partial markdown
+        ensureReply().innerHTML = renderMarkdown(raw);
+        pinBottom();
+      } else if (ev.done) {
+        final = ev;
+      } else if (ev.error) {
+        failure = new Error(ev.error);
+      }
+    };
+
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf('\n')) !== -1) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line.startsWith('data:')) continue;
+        try {
+          handle(JSON.parse(line.slice(5)));
+        } catch {
+          /* malformed frame — skip */
+        }
+      }
+    }
+
+    if (failure) throw failure; // partial text stays visible above the error line
+    const text = final?.text ?? raw;
+    if (!text) throw new Error('empty response');
+
+    typing.remove();
+    if (replyEl) replyEl.innerHTML = renderMarkdown(text);
+    else addMessage('max', text);
+    if (final?.provider) {
+      document.getElementById('model-chip').textContent = `${final.provider} · ${final.model || 'mesh'}`;
+    }
+    return text;
+  }
+
   async function ask(userQuery) {
     if (busy) return;
     busy = true; syncSend();
@@ -496,18 +530,13 @@
         reply = userQuery
           ? DEMO_REPLIES[demoIdx++ % DEMO_REPLIES.length]
           : DEMO_SEED[2].text;
+        typing.remove();
+        addMessage('max', reply);
       } else {
-        const res = await fetch('/api/max', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ studentDataContext: STUDENT_CONTEXT, userQuery }),
-        });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) throw new Error(data.error || `request failed (${res.status})`);
-        reply = data.text;
+        reply = await askStreamed(userQuery, typing);
       }
-      typing.remove();
-      addMessage('max', reply);
+      history.push({ role: 'user', text: userQuery }, { role: 'max', text: reply });
+      if (history.length > HISTORY_TURNS * 2) history.splice(0, history.length - HISTORY_TURNS * 2);
     } catch (err) {
       typing.remove();
       addMessage('error', `connection error — ${err.message}`);
