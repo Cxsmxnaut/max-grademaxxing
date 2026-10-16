@@ -149,5 +149,13 @@ export function createMeshFromEnv(env = process.env, meshOptions = {}) {
         '(comma-separated lists) in the server environment.'
     );
   }
-  return new TokenMesh({ slots, ...meshOptions });
+  // Default to 8s timeout for fast failover — free-tier APIs that don't
+  // respond in 8s are almost certainly rate-limited or broken. Without
+  // this, a single dead OpenRouter key burns 20s before the mesh tries
+  // the next slot, and with 5 dead keys that's 100s of wasted time.
+  const defaults = {
+    attemptTimeoutMs: 8_000,
+    streamIdleTimeoutMs: 8_000,
+  };
+  return new TokenMesh({ slots, ...defaults, ...meshOptions });
 }
