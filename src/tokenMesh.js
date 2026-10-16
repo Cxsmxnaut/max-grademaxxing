@@ -316,6 +316,10 @@ export class TokenMesh {
       if (data === null && controller.signal.aborted) {
         return this._timeoutFailure(slot, `response body stalled past ${this.attemptTimeoutMs}ms`);
       }
+      if (data && typeof data === 'object' && data.error != null) {
+        // Some gateways return HTTP 200 with a provider error document.
+        return this._providerErrorFailure(slot, res, data);
+      }
       return {
         ok: true,
         value: {
@@ -329,6 +333,27 @@ export class TokenMesh {
     } finally {
       if (timer) clearTimeout(timer);
     }
+  }
+
+  _providerErrorFailure(slot, res, data) {
+    const rawCode = Number(data?.error?.code);
+    const status = Number.isInteger(rawCode) ? rawCode : res.status || null;
+    const message =
+      typeof data?.error?.message === 'string' && data.error.message !== ''
+        ? data.error.message
+        : `provider error document (HTTP ${res.status ?? 'unknown'})`;
+    const base = { slotId: slot.id, provider: slot.provider, status, detail: truncate(message) };
+    if (status === 429) {
+      return { ok: false, benchMs: this.benchMs, error: { ...base, kind: 'rate_limit', message: truncate(message) } };
+    }
+    if (status === 401 || status === 403) {
+      return { ok: false, benchMs: this.invalidKeyBenchMs, error: { ...base, kind: 'invalid_key', message: truncate(message) } };
+    }
+    return {
+      ok: false,
+      benchMs: 0,
+      error: { ...base, kind: status != null && status < 500 ? 'client' : 'server', message: truncate(message) },
+    };
   }
 
   _timeoutFailure(slot, message) {
@@ -390,6 +415,9 @@ export class TokenMesh {
       } catch (err) {
         if (err?.isIdleTimeout) return this._timeoutFailure(slot, err.message);
       }
+      if (data && typeof data === 'object' && data.error != null) {
+        return this._providerErrorFailure(slot, res, data);
+      }
       const text = data?.choices?.[0]?.message?.content ?? '';
       if (text) onToken(text);
       return {
@@ -431,6 +459,12 @@ export class TokenMesh {
           } catch {
             continue; // malformed frame — skip, don't kill the stream
           }
+          if (chunk && typeof chunk === 'object' && chunk.error != null) {
+            const failure = this._providerErrorFailure(slot, res, chunk);
+            // After tokens, an error frame is still an interruption; before
+            // tokens it is an ordinary pre-token failover.
+            return { ...failure, benchMs: delivered ? 0 : failure.benchMs, partial: delivered };
+          }
           if (chunk.usage) usage = chunk.usage;
           if (chunk.model) model = chunk.model;
           const delta = chunk.choices?.[0]?.delta?.content;
@@ -462,6 +496,9 @@ export class TokenMesh {
     if (!delivered && !sawDone && buf.trim().startsWith('{')) {
       try {
         const data = JSON.parse(buf.trim());
+        if (data && typeof data === 'object' && data.error != null) {
+          return this._providerErrorFailure(slot, res, data);
+        }
         const text2 = data?.choices?.[0]?.message?.content ?? '';
         if (text2) {
           delivered = true;

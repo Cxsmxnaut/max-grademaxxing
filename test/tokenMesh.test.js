@@ -188,6 +188,76 @@ test('network errors fail over without benching', async () => {
   assert.equal(mesh.isBenched('a'), false);
 });
 
+test('HTTP 200 provider error document fails over without benching a transient outage', async () => {
+  const fetchImpl = async (url, init) =>
+    init.headers.authorization === 'Bearer key-a'
+      ? jsonResponse(200, { error: { message: 'Service temporarily overloaded', code: 503 } })
+      : jsonResponse(200, okBody('recovered'));
+  const mesh = new TokenMesh({ slots: [slot('a'), slot('b')], fetchImpl, random: identityRandom });
+
+  const result = await mesh.complete({ messages: [] });
+  assert.equal(result.text, 'recovered');
+  assert.equal(mesh.isBenched('a'), false);
+});
+
+test('streaming JSON fallback containing a provider error fails over', async () => {
+  const fetchImpl = async (url, init) => ({
+    ok: true,
+    status: 200,
+    body: undefined,
+    json: async () =>
+      init.headers.authorization === 'Bearer key-a'
+        ? { error: { message: 'Service temporarily overloaded', code: 503 } }
+        : { choices: [{ message: { content: 'recovered' } }], model: 'm2', usage: null },
+  });
+  const mesh = new TokenMesh({ slots: [slot('a'), slot('b')], fetchImpl, random: identityRandom });
+
+  const chunks = [];
+  const result = await mesh.completeStream({ messages: [] }, (c) => chunks.push(c));
+  assert.equal(result.text, 'recovered');
+  assert.deepEqual(chunks, ['recovered']);
+});
+
+test('SSE provider error frame before tokens fails over to the next key', async () => {
+  const errorBody = `data: ${JSON.stringify({ error: { message: 'Service temporarily overloaded', code: 503 } })}\n\n`;
+  const goodBody = `data: ${JSON.stringify({ choices: [{ delta: { content: 'recovered' } }] })}\n\ndata: [DONE]\n\n`;
+  const fetchImpl = async (url, init) =>
+    new Response(init.headers.authorization === 'Bearer key-a' ? errorBody : goodBody, {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' },
+    });
+  const mesh = new TokenMesh({ slots: [slot('a'), slot('b')], fetchImpl, random: identityRandom });
+
+  const chunks = [];
+  const result = await mesh.completeStream({ messages: [] }, (c) => chunks.push(c));
+  assert.equal(result.text, 'recovered');
+  assert.deepEqual(chunks, ['recovered']);
+});
+
+test('SSE provider error frame after tokens is a partial interruption, not a failover', async () => {
+  const calls = [];
+  const body =
+    `data: ${JSON.stringify({ choices: [{ delta: { content: 'partial ' } }] })}\n\n` +
+    `data: ${JSON.stringify({ error: { message: 'Service temporarily overloaded', code: 503 } })}\n\n`;
+  const fetchImpl = async (url, init) => {
+    calls.push(init.headers.authorization);
+    return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+  };
+  const mesh = new TokenMesh({ slots: [slot('a'), slot('b')], fetchImpl, random: identityRandom });
+
+  const chunks = [];
+  await assert.rejects(
+    () => mesh.completeStream({ messages: [] }, (c) => chunks.push(c)),
+    (err) => {
+      assert.equal(err.name, 'UpstreamError');
+      assert.match(err.message, /stream interrupted/i);
+      return true;
+    }
+  );
+  assert.deepEqual(chunks, ['partial ']);
+  assert.deepEqual(calls, ['Bearer key-a']);
+});
+
 test('per-provider model is injected into the outgoing payload', async () => {
   const seen = [];
   const fetchImpl = async (url, init) => {
