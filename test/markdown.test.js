@@ -91,3 +91,32 @@ test('realistic reply: heading + bold + code + list in one pass', () => {
   assert.ok(html.includes('<p>Done.</p>'));
   assert.ok(!html.includes('**'));
 });
+
+test('markdown tables render as <div class="table-wrap"><table> with <thead> and <tbody>', () => {
+  const md = [
+    '| Scenario | HW Avg | Final Needed |',
+    '| :--- | :---: | ---: |',
+    '| **25/25 HW** | 91% | **93.5%** |',
+    '| **20/25 HW** | 86% | 105.4% |',
+  ].join('\n');
+  const html = renderMarkdown(md);
+  assert.ok(html.includes('<div class="table-wrap"><table>'));
+  assert.ok(html.includes('<th>Scenario</th>'));
+  assert.ok(html.includes('<td><strong>25/25 HW</strong></td>'));
+  assert.ok(html.includes('<td><strong>93.5%</strong></td>'));
+});
+
+test('blockquotes and horizontal rules render cleanly', () => {
+  const html = renderMarkdown('--- \n\n> **Bottom Line:** Aim for a 94% on the final.');
+  assert.ok(html.includes('<hr>'));
+  assert.ok(html.includes('<blockquote><p><strong>Bottom Line:</strong> Aim for a 94% on the final.</p></blockquote>'));
+});
+
+test('LaTeX display and inline math delimiters are cleaned into readable math', () => {
+  const html = renderMarkdown('Solve $$0.30x \\ge 28.05$$ which gives $x \\ge \\frac{28.05}{0.30}$.');
+  assert.ok(!html.includes('$$'));
+  assert.ok(!html.includes('\\ge'));
+  assert.ok(!html.includes('\\frac'));
+  assert.ok(html.includes('≥'));
+  assert.ok(html.includes('(28.05) / (0.30)'));
+});

@@ -18,7 +18,7 @@
  * rejected (403), and each client IP gets a soft per-isolate rate ceiling
  * (429). Non-browser callers send no Origin header and pass the CSRF check.
  */
-import { askMaxDetailed } from '../src/index.js';
+import { askMaxDetailed, generateChatTitle } from '../src/index.js';
 import { requireSameOrigin, RateLimiter, clientIp } from '../src/httpGuard.js';
 
 // Vercel Node functions only expose res.write() when streaming is opted in.
@@ -110,6 +110,18 @@ export default async function handler(req, res) {
     }
   }
   body ??= {};
+
+  if (body.action === 'title') {
+    try {
+      const result = await generateChatTitle(body.userQuery, body.assistantReply ?? '', {
+        course: body.studentDataContext?.course ?? body.course ?? '',
+      });
+      return res.status(200).json(result);
+    } catch (err) {
+      const { status, payload } = classifyError(err);
+      return res.status(status).json(payload);
+    }
+  }
 
   if (body.stream === true) {
     streamMax(res, body);

@@ -18,10 +18,13 @@ export { PROVIDER_DEFAULTS, createPool, createPoolFromEnv, createMeshFromEnv } f
 
 export {
   MAX_SYSTEM_PROMPT,
+  MAX_TITLE_PROMPT,
   MAX_TEMPERATURE,
   buildMaxMessages,
   askMax,
   askMaxDetailed,
+  generateChatTitle,
+  cleanChatTitle,
   getDefaultMesh,
   setDefaultMesh,
 } from './max.js';

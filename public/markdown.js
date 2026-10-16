@@ -11,21 +11,95 @@
  *
  * Covered: **bold**, *italic* / _italic_, ***bold italic***, ~~strike~~,
  * inline `code`, fenced code blocks, unordered and ordered lists, ###
- * headings, single-newline becomes <br>, blank line starts a new paragraph.
+ * headings, Markdown tables, > blockquotes, --- horizontal rules, LaTeX math
+ * delimiter cleanup, single-newline becomes <br>, blank line starts a new
+ * paragraph.
  */
 
 export const mdEscape = (s) =>
   s.replace(/&/g, '&amp;').replace(/</g, '&lt;')
    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
+/**
+ * Convert common LaTeX math sequences into clean readable symbols so even if a
+ * model slips into $...$ or $$...$$ notation, students never see raw \frac or $$.
+ */
+function normalizeMath(raw) {
+  const cleanExpr = (expr) =>
+    expr
+      .replace(/\\(?:left|right|big|Big|bigg|Bigg)\s*([()[\]{}|.])?/g, (_m, d) => (d === '.' ? '' : d || ''))
+      .replace(/\\(?:text|textbf|mathbf|mathrm|mathit|boldsymbol|boxed)\{([^{}]*)\}/g, '$1')
+      .replace(/\\frac\{([^{}]+)\}\{([^{}]+)\}/g, '($1) / ($2)')
+      .replace(/\\ge(?:q)?\b/g, '≥')
+      .replace(/\\le(?:q)?\b/g, '≤')
+      .replace(/\\neq\b/g, '≠')
+      .replace(/\\approx\b/g, '≈')
+      .replace(/\\times\b/g, '×')
+      .replace(/\\cdot\b/g, '·')
+      .replace(/\\div\b/g, '÷')
+      .replace(/\\pm\b/g, '±')
+      .replace(/\\rightarrow\b|\\to\b|\\Rightarrow\b/g, '→')
+      .replace(/(\d+%?)\s+arrow\s+(\d+%?)/gi, '$1 → $2')
+      .replace(/\\%/g, '%')
+      .replace(/\\\s+/g, ' ')
+      .replace(/\\[,;:!]/g, ' ')
+      .trim();
+
+  return raw
+    // Display math $$...$$ or \[...\]
+    .replace(/\$\$([\s\S]*?)\$\$/g, (_m, inner) => `\n\`${cleanExpr(inner)}\`\n`)
+    .replace(/\\\[([\s\S]*?)\\\]/g, (_m, inner) => `\n\`${cleanExpr(inner)}\`\n`)
+    // Inline \( ... \)
+    .replace(/\\\(([^\n]*?)\\\)/g, (_m, inner) => cleanExpr(inner))
+    // Inline $...$ — strip math delimiters when inner is a math expression or number
+    .replace(/\$([^\s$][^$\n]*?[^\s$])\$/g, (_m, inner) => cleanExpr(inner))
+    .replace(/\$([A-Za-z0-9])\$/g, '$1')
+    // Also clean any stray LaTeX macros that leaked outside $...$
+    .replace(/\\(?:left|right|big|Big|bigg|Bigg)\s*([()[\]{}|.])?/g, (_m, d) => (d === '.' ? '' : d || ''))
+    .replace(/\\(?:text|textbf|mathbf|mathrm|mathit|boldsymbol|boxed)\{([^{}]*)\}/g, (_m, inner) => `**${inner.replace(/\\\s+/g, ' ').replace(/\\%/g, '%')}**`)
+    .replace(/\\frac\{([^{}]+)\}\{([^{}]+)\}/g, '($1) / ($2)')
+    .replace(/\\ge(?:q)?\b/g, '≥')
+    .replace(/\\le(?:q)?\b/g, '≤')
+    .replace(/\\approx\b/g, '≈')
+    .replace(/\\rightarrow\b|\\to\b|\\Rightarrow\b/g, '→')
+    .replace(/(\d+%?)\s+arrow\s+(\d+%?)/gi, '$1 → $2')
+    .replace(/\\times\b/g, '×')
+    .replace(/\\cdot\b/g, '·')
+    .replace(/\\div\b/g, '÷');
+}
+
+const isTableRow = (line) => {
+  const t = line.trim();
+  return t.startsWith('|') && t.endsWith('|') && t.length > 2;
+};
+
+const isTableSeparator = (line) => {
+  const t = line.trim();
+  if (!t.startsWith('|') || !t.endsWith('|')) return false;
+  const cells = t.slice(1, -1).split('|');
+  return cells.length > 0 && cells.every((c) => /^\s*:?-{2,}:?\s*$/.test(c));
+};
+
+const splitTableCells = (line) =>
+  line
+    .trim()
+    .replace(/^\|/, '')
+    .replace(/\|$/, '')
+    .split('|')
+    .map((c) => c.trim());
+
 export function renderMarkdown(src) {
+  // Strip any stray <think>...</think> blocks from reasoning models
+  let rawSrc = String(src ?? '').replace(/<think>[\s\S]*?<\/think>\s*/gi, '');
+
   // fenced code blocks → placeholders (escaped at extraction)
   const fences = [];
-  let text = String(src).replace(/```[a-z]*\n?([\s\S]*?)```/gi, (_m, code) => {
+  let text = rawSrc.replace(/```[a-z]*\n?([\s\S]*?)```/gi, (_m, code) => {
     fences.push('<pre><code>' + mdEscape(code.replace(/\n+$/, '')) + '</code></pre>');
     return '\u0000F' + (fences.length - 1) + '\u0000';
   });
 
+  text = normalizeMath(text);
   text = mdEscape(text);
 
   // inline code → placeholders so emphasis never rewrites inside it
@@ -40,23 +114,69 @@ export function renderMarkdown(src) {
   const emphasize = (line) => line
     .replace(/\*\*\*(?!\s)([^*]+?)(?<!\s)\*\*\*/g, '<strong><em>$1</em></strong>')
     .replace(/\*\*(?!\s)([^*]+?)(?<!\s)\*\*/g, '<strong>$1</strong>')
-    .replace(/(^|[\s(])\*(?!\s)([^*\n]+?)(?<!\s)\*(?=$|[\s).,!?;:])/, '$1<em>$2</em>')
-    .replace(/(^|[\s(])_(?!\s)([^_\n]+?)(?<!\s)_(?=$|[\s).,!?;:])/, '$1<em>$2</em>')
+    .replace(/(^|[\s(])\*(?!\s)([^*\n]+?)(?<!\s)\*(?=$|[\s).,!?;:])/g, '$1<em>$2</em>')
+    .replace(/(^|[\s(])_(?!\s)([^_\n]+?)(?<!\s)_(?=$|[\s).,!?;:])/g, '$1<em>$2</em>')
     .replace(/~~(?!\s)([^~]+?)(?<!\s)~~/g, '<del>$1</del>');
 
   const out = [];
   let list = null;
   let para = [];
+  let quote = [];
   const flushPara = () => { if (para.length) { out.push('<p>' + para.join('<br>') + '</p>'); para = []; } };
   const flushList = () => { if (list) { out.push('</' + list + '>'); list = null; } };
+  const flushQuote = () => { if (quote.length) { out.push('<blockquote><p>' + quote.join('<br>') + '</p></blockquote>'); quote = []; } };
+  const flushAll = () => { flushPara(); flushList(); flushQuote(); };
 
-  for (const raw of text.split('\n')) {
-    const line = raw.trimEnd();
-    if (!line.trim()) { flushPara(); flushList(); continue; }
+  const lines = text.split('\n');
+  for (let idx = 0; idx < lines.length; idx++) {
+    const line = lines[idx].trimEnd();
+    const trimmed = line.trim();
+    if (!trimmed) { flushAll(); continue; }
+
     // fence placeholders stand alone as blocks, never inside <p>
-    if (/^\u0000F\d+\u0000$/.test(line.trim())) { flushPara(); flushList(); out.push(line.trim()); continue; }
+    if (/^\u0000F\d+\u0000$/.test(trimmed)) { flushAll(); out.push(trimmed); continue; }
+
+    // horizontal rule: ---, ***, ___
+    if (/^(?:-{3,}|\*{3,}|_{3,})$/.test(trimmed)) {
+      flushAll();
+      out.push('<hr>');
+      continue;
+    }
+
+    // markdown table: header row + |---|---| separator row
+    if (isTableRow(trimmed) && idx + 1 < lines.length && isTableSeparator(lines[idx + 1])) {
+      flushAll();
+      const headers = splitTableCells(trimmed);
+      idx++; // skip separator line
+      const rows = [];
+      while (idx + 1 < lines.length && isTableRow(lines[idx + 1])) {
+        idx++;
+        rows.push(splitTableCells(lines[idx]));
+      }
+      const thead = '<thead><tr>' + headers.map((h) => '<th>' + emphasize(h) + '</th>').join('') + '</tr></thead>';
+      const tbody = rows.length
+        ? '<tbody>' +
+          rows
+            .map((r) => '<tr>' + headers.map((_, ci) => '<td>' + emphasize(r[ci] ?? '') + '</td>').join('') + '</tr>')
+            .join('') +
+          '</tbody>'
+        : '';
+      out.push('<div class="table-wrap"><table>' + thead + tbody + '</table></div>');
+      continue;
+    }
+
+    // blockquote: > text (escaped as &gt;)
+    const bq = line.match(/^\s*&gt;\s?(.*)$/);
+    if (bq) {
+      flushPara();
+      flushList();
+      if (bq[1].trim()) quote.push(emphasize(bq[1]));
+      continue;
+    }
+    flushQuote();
+
     const heading = line.match(/^\s{0,3}#{1,6}\s+(.*)$/);
-    if (heading) { flushPara(); flushList(); out.push('<h3>' + emphasize(heading[1]) + '</h3>'); continue; }
+    if (heading) { flushAll(); out.push('<h3>' + emphasize(heading[1]) + '</h3>'); continue; }
     const ul = line.match(/^\s*[-*+]\s+(.*)$/);
     const ol = line.match(/^\s*\d+[.)]\s+(.*)$/);
     if (ul || ol) {
@@ -69,8 +189,7 @@ export function renderMarkdown(src) {
     flushList();
     para.push(emphasize(line));
   }
-  flushPara();
-  flushList();
+  flushAll();
 
   return out.join('')
     .replace(/\u0000C(\d+)\u0000/g, (_m, i) => spans[+i])

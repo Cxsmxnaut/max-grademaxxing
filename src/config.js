@@ -9,33 +9,37 @@ import { TokenMesh } from './tokenMesh.js';
 
 /**
  * Free-tier defaults (verified October 2026):
- *   - Groq hosts no Llama/Gemma chat models anymore (they were all retired
- *     for the developer tier); qwen3.8-27b is its best free chat model and
- *     writes far more naturally than gpt-oss-20b.
- *   - OpenRouter free catalog rotates often; nemotron-3.5-lightning:free was
- *     the verified live zero-cost endpoint.
+ *   - Groq: openai/gpt-oss-120b is OpenAI's 120B flagship hosted free on Groq
+ *     with 1,000 req/day and 8,000 TPM per key (across 5 keys = 5,000 req/day),
+ *     sub-second time-to-first-token, and native ChatGPT formatting & math
+ *     accuracy. (By contrast, qwen/qwen3.8-27b on Groq has a 1,000 OTPM cap
+ *     that rejects long step-by-step math explanations with HTTP 413/429.)
+ *   - Gemini: gemini-3.5-flash is Google AI Studio's fast, high-quota free
+ *     workhorse (gemini-3.8-flash has a tiny 20 RPD free-tier cap that
+ *     exhausts almost immediately).
+ *   - OpenRouter: nvidia/nemotron-3-ultra-550b-a55b:free is the fastest,
+ *     highest-capacity free model on OpenRouter (~400ms latency vs 20s+ hangs
+ *     on nemotron-3.5-lightning:free).
  *   - Mistral: mistral-small-latest is the documented stable alias.
- *   - Gemini: gemini-3.8-flash is the newest flash BOTH of our Gemini keys
- *     can serve (newer accounts no longer see gemini-2.5-flash), and it is
- *     the tone/quality baseline for Max.
  */
 export const PROVIDER_DEFAULTS = {
   // Tier 1 = primary waterfall layer: tried before any Tier-2 slot.
   gemini: {
     // Google AI Studio keys speak OpenAI-compatible protocol here; free tier.
-    // (gemini-flash-latest 503s under load; 2.5-flash is the stable workhorse.)
+    // gemini-3.5-flash is the fast, high-quota free workhorse (gemini-3.8-flash
+    // has a tiny 20 RPD free-tier cap that exhausts immediately).
     baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
-    model: 'gemini-3.8-flash',
+    model: 'gemini-3.5-flash',
     tier: 1,
   },
   groq: {
     baseUrl: 'https://api.groq.com/openai/v1',
-    model: 'qwen/qwen3.8-27b',
+    model: 'openai/gpt-oss-120b',
     tier: 2,
   },
   openrouter: {
     baseUrl: 'https://openrouter.ai/api/v1',
-    model: 'nvidia/nemotron-3.5-lightning:free',
+    model: 'nvidia/nemotron-3-ultra-550b-a55b:free',
     tier: 2,
   },
   mistral: {
@@ -89,6 +93,25 @@ const splitKeys = (value) =>
     .filter(Boolean);
 
 /**
+ * Normalize deprecated or ultra-low-quota model overrides so stale env vars
+ * (e.g. GEMINI_MODEL=gemini-3.8-flash with a 20 RPD cap, or
+ * GROQ_MODEL=qwen/qwen3.8-27b with a 1,000 OTPM cap) automatically upgrade to
+ * the high-quota workhorse models.
+ */
+const STALE_MODEL_UPGRADES = {
+  'gemini-3.8-flash': 'gemini-3.5-flash',
+  'gemini-2.5-flash': 'gemini-3.5-flash',
+  'qwen/qwen3.8-27b': 'openai/gpt-oss-120b',
+  'nvidia/nemotron-3.5-lightning:free': 'nvidia/nemotron-3-ultra-550b-a55b:free',
+};
+
+const resolveModel = (override, fallback) => {
+  const trimmed = typeof override === 'string' ? override.trim() : '';
+  if (!trimmed) return fallback;
+  return STALE_MODEL_UPGRADES[trimmed] ?? trimmed;
+};
+
+/**
  * Pool from environment variables (comma-separated key lists):
  *   GROQ_API_KEYS, OPENROUTER_API_KEYS, MISTRAL_API_KEYS, GEMINI_API_KEYS
  * Optional overrides:
@@ -106,7 +129,12 @@ export function createPoolFromEnv(env = process.env) {
     },
     {
       env,
-      models: { groq: env.GROQ_MODEL, openrouter: env.OPENROUTER_MODEL, mistral: env.MISTRAL_MODEL, gemini: env.GEMINI_MODEL },
+      models: {
+        groq: resolveModel(env.GROQ_MODEL, PROVIDER_DEFAULTS.groq.model),
+        openrouter: resolveModel(env.OPENROUTER_MODEL, PROVIDER_DEFAULTS.openrouter.model),
+        mistral: resolveModel(env.MISTRAL_MODEL, PROVIDER_DEFAULTS.mistral.model),
+        gemini: resolveModel(env.GEMINI_MODEL, PROVIDER_DEFAULTS.gemini.model),
+      },
       baseUrls: { groq: env.GROQ_BASE_URL, openrouter: env.OPENROUTER_BASE_URL, mistral: env.MISTRAL_BASE_URL, gemini: env.GEMINI_BASE_URL },
     }
   );

@@ -13,7 +13,7 @@
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
-import { askMaxDetailed } from '../src/index.js';
+import { askMaxDetailed, generateChatTitle } from '../src/index.js';
 import { requireSameOrigin, RateLimiter, clientIp } from '../src/httpGuard.js';
 
 // load local dev keys if present (process.loadEnvFile: zero-dependency .env)
@@ -201,6 +201,18 @@ const server = createServer(async (req, res) => {
       }
       if (body.history != null && Buffer.byteLength(raw) > MAX_HISTORY_BYTES) {
         return sendJson(res, 413, { error: 'history too large' });
+      }
+
+      if (body.action === 'title') {
+        try {
+          const result = await generateChatTitle(body.userQuery, body.assistantReply ?? '', {
+            course: body.studentDataContext?.course ?? body.course ?? '',
+          });
+          return sendJson(res, 200, result);
+        } catch (err) {
+          const { status, payload } = classifyError(err);
+          return sendJson(res, status, payload);
+        }
       }
 
       if (body.stream === true) {

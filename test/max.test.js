@@ -1,6 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { askMax, askMaxDetailed, buildMaxMessages, MAX_SYSTEM_PROMPT, MAX_TEMPERATURE, setDefaultMesh } from '../src/max.js';
+import {
+  askMax,
+  askMaxDetailed,
+  buildMaxMessages,
+  generateChatTitle,
+  cleanChatTitle,
+  MAX_SYSTEM_PROMPT,
+  MAX_TEMPERATURE,
+  setDefaultMesh,
+} from '../src/max.js';
 import { createPool, createPoolFromEnv } from '../src/config.js';
 
 const CONTEXT = {
@@ -145,4 +154,22 @@ test('default mesh is swappable and askMax uses it', async () => {
   } finally {
     setDefaultMesh(null); // restore lazy env-based default for other tests
   }
+});
+
+test('generateChatTitle asks the mesh for a concise ChatGPT-style sidebar title and cleans it', async () => {
+  const mesh = recordingMesh('"AP Calc Final Target."');
+  const res = await generateChatTitle(
+    'What do I need on the AP Calc final to get a 90%?',
+    'You need at least 93.5% on the final exam.',
+    { mesh, course: 'AP Calculus BC' }
+  );
+  assert.equal(res.title, 'AP Calc Final Target');
+  assert.equal(res.provider, 'stub');
+  assert.equal(mesh.calls.length, 1);
+  assert.equal(mesh.calls[0].temperature, 0.2);
+});
+
+test('cleanChatTitle strips quotes, markdown, and falls back to user query when model output is empty', () => {
+  assert.equal(cleanChatTitle('Title: **Chem Unit 2 Recovery!**'), 'Chem Unit 2 Recovery!');
+  assert.equal(cleanChatTitle('', 'what do i need on my ap chem final exam'), 'what do i need on');
 });
