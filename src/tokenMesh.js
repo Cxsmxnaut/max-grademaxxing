@@ -14,6 +14,11 @@
  *   5. HTTP 5xx / network drop -> fail over to the next key without benching.
  *   6. Every key benched       -> wait for the shortest bench to expire
  *      (bounded by maxPoolWaitMs) instead of failing the user.
+ *   7. Hung upstreams          -> every fetch carries an abort signal: a
+ *      silent provider is cut off (attemptTimeoutMs for non-stream, idle
+ *      timeout between SSE chunks), benched like a rate limit, and the
+ *      request fails over — no key can stall a reply until the platform
+ *      kills the invocation.
  *
  * The mesh is stateless with respect to conversations: it only ever tracks
  * per-key bench timers. No message history is stored, ever.
@@ -23,6 +28,8 @@ export const DEFAULT_BENCH_MS = 60_000; // 60 seconds, per spec
 export const DEFAULT_BENCH_JITTER_MS = 1_000; // avoids thundering-herd retries
 export const INVALID_KEY_BENCH_MS = 10 * 60_000; // 401/403 keys get a longer penalty
 export const DEFAULT_MAX_POOL_WAIT_MS = 120_000;
+export const DEFAULT_ATTEMPT_TIMEOUT_MS = 20_000; // non-stream: headers + body must finish within this
+export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 20_000; // stream: max silence between SSE reads (first read included)
 
 export class PoolExhaustedError extends Error {
   constructor(message) {
@@ -81,6 +88,8 @@ export class TokenMesh {
    * @param {number}   [opts.benchJitterMs=1000]   random extra added to each bench
    * @param {number}   [opts.invalidKeyBenchMs=600000] penalty for 401/403
    * @param {number}   [opts.maxPoolWaitMs=120000] max time to wait when all keys are benched
+   * @param {number}   [opts.attemptTimeoutMs=20000]   abort a hung non-stream attempt (0 disables)
+   * @param {number}   [opts.streamIdleTimeoutMs=20000] abort an SSE stream silent this long (0 disables)
    * @param {Function} [opts.fetchImpl=fetch]      injectable for tests
    * @param {Function} [opts.random=Math.random]   injectable for deterministic shuffles
    * @param {Function} [opts.sleep]                injectable for tests
@@ -92,6 +101,8 @@ export class TokenMesh {
     benchJitterMs = DEFAULT_BENCH_JITTER_MS,
     invalidKeyBenchMs = INVALID_KEY_BENCH_MS,
     maxPoolWaitMs = DEFAULT_MAX_POOL_WAIT_MS,
+    attemptTimeoutMs = DEFAULT_ATTEMPT_TIMEOUT_MS,
+    streamIdleTimeoutMs = DEFAULT_STREAM_IDLE_TIMEOUT_MS,
     fetchImpl = globalThis.fetch,
     random = Math.random,
     sleep = defaultSleep,
@@ -118,6 +129,8 @@ export class TokenMesh {
     this.benchJitterMs = benchJitterMs;
     this.invalidKeyBenchMs = invalidKeyBenchMs;
     this.maxPoolWaitMs = maxPoolWaitMs;
+    this.attemptTimeoutMs = attemptTimeoutMs;
+    this.streamIdleTimeoutMs = streamIdleTimeoutMs;
     this.fetchImpl = fetchImpl;
     this.random = random;
     this.sleep = sleep;
@@ -282,25 +295,71 @@ export class TokenMesh {
     }
   }
 
-  /** POST one payload to one slot; no streaming. */
+  /**
+   * POST one payload to one slot; no streaming.
+   * The whole attempt (response headers + JSON body) must finish within
+   * attemptTimeoutMs, otherwise the fetch is aborted, the key is benched
+   * (kind 'timeout') and routing moves on.
+   */
   async _attempt(slot, payload) {
     const url = this._chatUrl(slot);
     const body = JSON.stringify({ ...payload, model: slot.model });
 
-    const res = await this._post(url, slot, body);
-    if (!res.ok) return this._classifyHttp(slot, res);
+    const controller = new AbortController();
+    const timer = this.attemptTimeoutMs > 0 ? setTimeout(() => controller.abort(), this.attemptTimeoutMs) : null;
 
-    const data = await res.json().catch(() => null);
+    try {
+      const res = await this._post(url, slot, body, controller.signal);
+      if (!res.ok) return await this._classifyHttp(slot, res);
+
+      const data = await res.json().catch(() => null);
+      if (data === null && controller.signal.aborted) {
+        return this._timeoutFailure(slot, `response body stalled past ${this.attemptTimeoutMs}ms`);
+      }
+      return {
+        ok: true,
+        value: {
+          text: data?.choices?.[0]?.message?.content ?? '',
+          provider: slot.provider,
+          model: data?.model ?? slot.model,
+          slotId: slot.id,
+          usage: data?.usage ?? null,
+        },
+      };
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  _timeoutFailure(slot, message) {
     return {
-      ok: true,
-      value: {
-        text: data?.choices?.[0]?.message?.content ?? '',
-        provider: slot.provider,
-        model: data?.model ?? slot.model,
-        slotId: slot.id,
-        usage: data?.usage ?? null,
-      },
+      ok: false,
+      benchMs: this.benchMs,
+      error: { slotId: slot.id, provider: slot.provider, status: null, kind: 'timeout', message: truncate(message) },
     };
+  }
+
+  /**
+   * Race a promise (a body read, or the fallback JSON parse) against the
+   * stream idle timeout. On expiry the fetch is aborted — releasing the
+   * socket — and an error flagged `isIdleTimeout` is thrown so the caller
+   * can classify it as a timeout instead of a plain network drop.
+   */
+  _withIdleTimeout(promise, controller) {
+    if (!(this.streamIdleTimeoutMs > 0)) return promise;
+    let timer;
+    const expiry = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        // Reject with the flagged error BEFORE aborting: the abort makes the
+        // pending read reject too, and that AbortError must not win the race
+        // (it would be classified as a plain network drop, without benching).
+        const err = new Error(`TokenMesh: stream silent for ${this.streamIdleTimeoutMs}ms`);
+        err.isIdleTimeout = true;
+        reject(err);
+        controller.abort();
+      }, this.streamIdleTimeoutMs);
+    });
+    return Promise.race([promise, expiry]).finally(() => clearTimeout(timer));
   }
 
   /**
@@ -312,14 +371,25 @@ export class TokenMesh {
     const url = this._chatUrl(slot);
     const body = JSON.stringify({ ...payload, model: slot.model, stream: true });
 
-    const res = await this._post(url, slot, body);
+    // Stage 1: response headers must arrive within attemptTimeoutMs — a
+    // provider that never answers is aborted before it can stall the reply.
+    const controller = new AbortController();
+    const startTimer = this.attemptTimeoutMs > 0 ? setTimeout(() => controller.abort(), this.attemptTimeoutMs) : null;
+    const res = await this._post(url, slot, body, controller.signal);
+    if (startTimer) clearTimeout(startTimer);
     if (!res.ok) return this._classifyHttp(slot, res);
 
     // Defensive fallback: a provider that ignores stream:true answers with a
-    // normal JSON body — parse it and deliver it as one chunk.
+    // normal JSON body — parse it (under the idle timeout) and deliver it as
+    // one chunk.
     const reader = typeof res.body?.getReader === 'function' ? res.body.getReader() : null;
     if (!reader) {
-      const data = await res.json().catch(() => null);
+      let data = null;
+      try {
+        data = await this._withIdleTimeout(res.json(), controller);
+      } catch (err) {
+        if (err?.isIdleTimeout) return this._timeoutFailure(slot, err.message);
+      }
       const text = data?.choices?.[0]?.message?.content ?? '';
       if (text) onToken(text);
       return {
@@ -338,7 +408,8 @@ export class TokenMesh {
 
     try {
       for (;;) {
-        const { done, value } = await reader.read();
+        // Idle-bounded: covers both "never starts" and "stalls mid-answer".
+        const { done, value } = await this._withIdleTimeout(reader.read(), controller);
         if (done) break;
         buf += decoder.decode(value, { stream: true });
 
@@ -372,14 +443,18 @@ export class TokenMesh {
         if (sawDone) break;
       }
     } catch (streamError) {
+      // A silent stream before the first token is a timeout: bench the key
+      // and fail over. After the first token it stays an interruption
+      // (partial) — the caller must not stitch a second provider's answer on.
+      const timedOut = streamError?.isIdleTimeout === true && !delivered;
       const error = {
         slotId: slot.id,
         provider: slot.provider,
-        kind: delivered ? 'stream' : 'network',
+        kind: delivered ? 'stream' : timedOut ? 'timeout' : 'network',
         message: truncate(streamError?.message ?? String(streamError)),
       };
       // partial:true only when the caller already saw tokens.
-      return { ok: false, benchMs: 0, error, partial: delivered };
+      return { ok: false, benchMs: timedOut ? this.benchMs : 0, error, partial: delivered };
     }
 
     // Whole body buffered but never framed as SSE (some proxies re-wrap the
@@ -410,7 +485,7 @@ export class TokenMesh {
     return `${slot.baseUrl.replace(/\/+$/, '')}/chat/completions`;
   }
 
-  async _post(url, slot, body) {
+  async _post(url, slot, body, signal) {
     try {
       return await this.fetchImpl(url, {
         method: 'POST',
@@ -420,15 +495,19 @@ export class TokenMesh {
           ...slot.headers,
         },
         body,
+        signal,
       });
     } catch (networkError) {
-      // DNS blip, connection reset, timeout — fail over, do not bench.
+      // DNS blip, connection reset — fail over, do not bench. An abort from
+      // our own timer is a timeout: bench the silent key so the next request
+      // skips it instead of paying the timeout again.
       // Returned as a response-shaped failure so both attempt paths share
       // the classification below.
       return {
         ok: false,
         status: 0,
         _networkError: truncate(networkError?.message ?? String(networkError)),
+        ...(signal?.aborted ? { _timeout: true } : {}),
         json: async () => null,
         text: async () => '',
       };
@@ -439,6 +518,11 @@ export class TokenMesh {
   async _classifyHttp(slot, res) {
     const base = { slotId: slot.id, provider: slot.provider, status: res.status || null };
 
+    if (res._timeout) {
+      // Our abort timer fired: the provider produced nothing within the
+      // attempt timeout. Bench it (like a rate limit) and fail over.
+      return { ok: false, benchMs: this.benchMs, error: { ...base, kind: 'timeout', message: res._networkError } };
+    }
     if (res._networkError !== undefined || res.status === 0) {
       return { ok: false, benchMs: 0, error: { ...base, kind: 'network', message: res._networkError } };
     }
